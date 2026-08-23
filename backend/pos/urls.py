@@ -1,0 +1,28 @@
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('', views.api_root, name='api-root'),
+    path('auth/login/', views.login_view),
+    path('auth/refresh/', views.refresh_view),
+    path('auth/me/', views.me_view),
+    path('dashboard/', views.dashboard_view),
+    path('accounting/', views.accounting_view),
+    path('products/', views.products_view),
+    path('products/<str:product_id>/', views.product_detail_view),
+    path('customers/', views.customers_view),
+    path('suppliers/', views.suppliers_view),
+    path('sales/', views.sales_view),
+    path('cashier/pending/', views.cashier_pending_view),
+    path('payments/<str:sale_id>/', views.payment_view),
+    path('deliveries/', views.deliveries_view),
+    path('deliveries/<str:sale_id>/confirm/', views.confirm_delivery_view),
+    path('purchases/', views.purchases_view),
+    path('returns/', views.returns_view),
+    path('expenses/', views.expenses_view),
+    path('treasury/', views.treasury_view),
+    path('stock/movements/', views.stock_movements_view),
+    path('analytics/', views.analytics_view),
+    path('forecast/', views.forecast_view),
+    path('logs/', views.logs_view),
+]
