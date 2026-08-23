@@ -9,10 +9,13 @@ from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view
 
-from .models import (ActivityLog, CashMovement, Category, Customer, Expense, Lot,
-					 Payment, Product, Purchase, PurchaseItem, Return, Sale,
-					 SaleCostAllocation, SaleDetail, Setting, StockMovement,
-					 Supplier, Unit, User)
+import csv
+import io
+from django.db import models
+from .models import (ActivityLog, CaisseSession, CashMovement, Category, Coupon, Customer,
+					 Expense, Lot, Magasin, Payment, Product, Purchase, PurchaseItem,
+					 Return, Sale, SaleCostAllocation, SaleDetail, ServiceContract,
+					 Setting, StockMovement, StockTransfer, Supplier, Unit, User)
 
 
 def ok(data, message='OK'): return JsonResponse({'success': True, 'data': data, 'message': message})
@@ -46,7 +49,7 @@ def user_from(request):
 def serialize(obj):
 	if isinstance(obj, Product):
 		return {'id': obj.id, 'nom': obj.nom, 'marque': obj.marque, 'modele': obj.modele, 'reference': obj.reference, 'categorie_id': obj.categorie_id, 'type_tracabilite': obj.type_tracabilite, 'prix_achat': float(obj.prix_achat), 'prix_vente': float(obj.prix_vente), 'seuil_min': float(obj.seuil_min), 'fournisseur_id': obj.fournisseur_id, 'statut': obj.statut, 'stock': float(obj.stock)}
-	if isinstance(obj, (Customer, Supplier, Category, Expense, Return, Purchase, Sale, StockMovement, ActivityLog, CashMovement)):
+	if isinstance(obj, (Customer, Supplier, Category, Expense, Return, Purchase, Sale, StockMovement, ActivityLog, CashMovement, Magasin, Coupon, ServiceContract, CaisseSession, StockTransfer)):
 		return {field.name: getattr(obj, field.attname) for field in obj._meta.fields}
 	if isinstance(obj, (Lot, Unit, SaleDetail)):
 		return {field.name: getattr(obj, field.attname) for field in obj._meta.fields}
@@ -174,17 +177,39 @@ def purchases_view(request):
 	audit(user, 'CREATE', 'PURCHASES', purchase.id, str(purchase.cout_total)); return ok({'id': purchase.id})
 
 
-@csrf_exempt
-@api_view(['GET', 'POST'])
-@transaction.atomic
-def sales_view(request):
-	user, error = require_user(request)
-	if error: return error
-	if request.method == 'GET': return ok([serialize(x) for x in Sale.objects.all().order_by('-created_at')])
-	data = body(request); lines = data.get('lignes', [])
+def create_sale_internal(user, data):
+	lines = data.get('lignes', [])
 	if not lines: return fail('La vente doit contenir au moins un produit')
 	is_proforma = bool(data.get('proforma'))
-	sale = Sale.objects.create(id=uid('DEV') if is_proforma else uid('VTE'), reference=uid('DEV') if is_proforma else uid('VTE'), client_id=data.get('client_id'), vendeur=user, date=date.today(), heure=datetime.now().time(), mode_paiement=data.get('mode_paiement', 'ESPECES'), statut_paiement='EN_ATTENTE' if is_proforma else data.get('statut_paiement', 'PAYE'), statut='PROFORMA' if is_proforma else data.get('statut', 'PAYEE'))
+
+	# Coupon processing
+	coupon = None
+	coupon_code = str(data.get('coupon_code', '')).strip().upper()
+	if coupon_code:
+		coupon = Coupon.objects.filter(code=coupon_code, actif=True).first()
+		if not coupon:
+			return fail('Coupon invalide ou inactif')
+		if coupon.date_expiration and coupon.date_expiration < date.today():
+			return fail('Coupon expiré')
+
+	statut_p = data.get('statut_paiement', 'EN_ATTENTE' if is_proforma else 'PAYE')
+	statut_v = 'PROFORMA' if is_proforma else ('PAYEE' if statut_p == 'PAYE' else 'VALIDEE')
+
+	sale = Sale.objects.create(
+		id=uid('DEV') if is_proforma else uid('VTE'),
+		reference=uid('DEV') if is_proforma else uid('VTE'),
+		magasin=getattr(user, 'magasin', None),
+		client_id=data.get('client_id'),
+		vendeur=user,
+		proforma_commercial=user if is_proforma else None,
+		date=date.today(),
+		heure=datetime.now().time(),
+		mode_paiement=data.get('mode_paiement', 'ESPECES'),
+		statut_paiement=statut_p,
+		statut=statut_v,
+		coupon=coupon
+	)
+
 	if is_proforma:
 		subtotal = Decimal('0'); discount = Decimal('0')
 		for line in lines:
@@ -192,8 +217,16 @@ def sales_view(request):
 			if qty <= 0 or price < 0 or rem < 0 or rem > price * qty: return fail('Quantité, prix ou remise invalide')
 			line_total = price * qty - rem; subtotal += price * qty; discount += rem
 			SaleDetail.objects.create(id=uid('DEVD'), vente=sale, produit=product, produit_nom=product.nom, quantite=qty, prix_unitaire=price, remise=rem, sous_total=line_total, montant_vente_net=line_total, net_amount=line_total, cout_statut='NON_RECONCILIE')
-		sale.sous_total = subtotal; sale.remise_totale = discount; sale.total_ttc = subtotal - discount; sale.save(update_fields=['sous_total', 'remise_totale', 'total_ttc'])
+
+		total_before_coupon = subtotal - discount
+		coupon_discount = Decimal('0')
+		if coupon:
+			if coupon.type_remise == 'POURCENTAGE': coupon_discount = total_before_coupon * (coupon.valeur / Decimal('100'))
+			else: coupon_discount = min(total_before_coupon, coupon.valeur)
+
+		sale.sous_total = subtotal; sale.remise_totale = discount + coupon_discount; sale.total_ttc = max(Decimal('0'), total_before_coupon - coupon_discount); sale.save(update_fields=['sous_total', 'remise_totale', 'total_ttc'])
 		audit(user, 'CREATE', 'PROFORMAS', sale.id, str(sale.total_ttc)); return ok({'id': sale.id, 'reference': sale.reference, 'total': float(sale.total_ttc), 'statut': sale.statut}, 'Proforma créée')
+
 	subtotal = Decimal('0'); discount = Decimal('0')
 	for line in lines:
 		product = Product.objects.select_for_update().get(id=line['produit_id']); qty = Decimal(str(line.get('quantite', 0))); price = Decimal(str(line.get('prix_unitaire', product.prix_vente))); rem = Decimal(str(line.get('remise', 0) or 0)); before = Decimal(str(product.stock))
@@ -215,12 +248,138 @@ def sales_view(request):
 			allocated_net = line_total * quantity / qty if qty else Decimal('0'); total_cost = quantity * unit_cost; margin = allocated_net - total_cost
 			detail = SaleDetail.objects.create(id=uid('VTED'), vente=sale, produit=product, produit_nom=product.nom, quantite=quantity, prix_unitaire=price, remise=rem * quantity / qty if qty else Decimal('0'), sous_total=allocated_net, unite_id=source_id if unit else '', lot_id=source_id if lot else '', source_type=source_type, source_id=source_id, montant_vente_net=allocated_net, cout_unitaire_reel=unit_cost, cout_total=total_cost, marge_brute=margin, taux_marge=(margin / allocated_net * 100 if allocated_net else 0), cout_statut='RECONCILIE', net_amount=allocated_net, total_cost=total_cost, gross_margin=margin, margin_rate=(margin / allocated_net * 100 if allocated_net else 0))
 			SaleCostAllocation.objects.create(sale_item=detail, source_type=source_type, inventory_unit=unit, inventory_lot=lot, quantity=quantity, unit_cost=unit_cost, total_cost=total_cost)
-		StockMovement.objects.create(id=uid('MOV'), date=date.today(), heure=datetime.now().time(), type='SORTIE', produit=product, quantite=qty, reference=sale.reference, motif='Vente', stock_avant=before, stock_apres=before-qty, utilisateur=user)
-	sale.sous_total = subtotal; sale.remise_totale = discount; sale.total_ttc = subtotal-discount; sale.save()
+		StockMovement.objects.create(id=uid('MOV'), date=date.today(), heure=datetime.now().time(), type='SORTIE', produit=product, quantite=qty, reference=sale.reference, motif='Vente', stock_avant=before, stock_apres=before-qty, utilisateur=user, magasin_source=getattr(user, 'magasin', None))
+
+	total_before_coupon = subtotal - discount
+	coupon_discount = Decimal('0')
+	if coupon:
+		if coupon.type_remise == 'POURCENTAGE': coupon_discount = total_before_coupon * (coupon.valeur / Decimal('100'))
+		else: coupon_discount = min(total_before_coupon, coupon.valeur)
+
+	sale.sous_total = subtotal; sale.remise_totale = discount + coupon_discount; sale.total_ttc = max(Decimal('0'), total_before_coupon - coupon_discount); sale.save()
+
+	# Update loyalty points
+	if sale.client_id:
+		customer = Customer.objects.filter(id=sale.client_id).first()
+		if customer:
+			customer.points_fidelite += int(sale.total_ttc // Decimal('1000'))
+			customer.save(update_fields=['points_fidelite'])
+
 	if sale.statut_paiement == 'PAYE':
 		Payment.objects.create(id=uid('PAY'), sale=sale, amount=sale.total_ttc, method=sale.mode_paiement, date=date.today(), status='PAID')
 		CashMovement.objects.create(id=uid('CASH'), date=date.today(), heure=datetime.now().time(), type='VENTE', reference=sale.reference, description='Vente', montant_entree=sale.total_ttc, mode_paiement=sale.mode_paiement, categorie='Ventes', utilisateur=user)
-	audit(user, 'CREATE', 'SALES', sale.id, str(sale.total_ttc)); return ok({'id': sale.id, 'total': float(sale.total_ttc)})
+	audit(user, 'CREATE', 'SALES', sale.id, str(sale.total_ttc)); return ok({'id': sale.id, 'reference': sale.reference, 'total': float(sale.total_ttc), 'statut': sale.statut})
+
+
+@csrf_exempt
+@api_view(['GET', 'POST'])
+@transaction.atomic
+def sales_view(request):
+	user, error = require_user(request)
+	if error: return error
+	if request.method == 'GET':
+		qs = Sale.objects.all().order_by('-created_at')
+		if user.role == 'COMMERCIAL':
+			qs = qs.filter(models.Q(statut__in=['VALIDEE', 'PAYEE', 'LIVREE']) | models.Q(proforma_commercial=user) | models.Q(vendeur=user))
+		elif user.role in ['CAISSIER', 'MAGASINIER']:
+			qs = qs.exclude(statut='PROFORMA')
+		return ok([serialize(x) for x in qs])
+
+	return create_sale_internal(user, body(request))
+
+
+@csrf_exempt
+@api_view(['POST'])
+def import_excel_sales_view(request):
+	user, error = require_user(request)
+	if error: return error
+	data = body(request)
+	file_content = data.get('content', '')
+	is_proforma = bool(data.get('proforma', False))
+	client_id = data.get('client_id')
+	if not client_id:
+		c = Customer.objects.first()
+		client_id = c.id if c else Customer.objects.create(id=uid('CUS'), nom='Client').id
+
+	lines_input = []
+	if 'lignes' in data and isinstance(data['lignes'], list):
+		lines_input = data['lignes']
+	elif file_content:
+		reader = csv.DictReader(io.StringIO(file_content))
+		for row in reader:
+			ref_or_name = (row.get('reference') or row.get('code') or row.get('produit') or row.get('nom') or '').strip()
+			qty = Decimal(str(row.get('quantite') or row.get('qty') or '1'))
+			price = Decimal(str(row.get('prix') or row.get('prix_unitaire') or '0'))
+			rem = Decimal(str(row.get('remise') or '0'))
+			product = None
+			if ref_or_name:
+				product = Product.objects.filter(models.Q(reference__iexact=ref_or_name) | models.Q(nom__iexact=ref_or_name) | models.Q(id=ref_or_name)).first()
+			if product:
+				lines_input.append({
+					'produit_id': product.id,
+					'quantite': float(qty),
+					'prix_unitaire': float(price if price > 0 else product.prix_vente),
+					'remise': float(rem)
+				})
+
+	if not lines_input:
+		return fail('Aucun article valide trouvé dans le fichier d’importation')
+
+	sale_request_data = {
+		'client_id': client_id,
+		'proforma': is_proforma,
+		'lignes': lines_input
+	}
+	return create_sale_internal(user, sale_request_data)
+
+
+@csrf_exempt
+@api_view(['POST'])
+def convert_proforma_view(request, sale_id):
+	user, error = require_user(request)
+	if error: return error
+	sale = Sale.objects.filter(id=sale_id, statut='PROFORMA').first()
+	if not sale: return fail('Proforma introuvable ou déjà convertie', 404)
+	if user.role == 'COMMERCIAL' and sale.proforma_commercial_id and sale.proforma_commercial_id != user.id:
+		return fail('Accès refusé à cette proforma', 403)
+	sale.statut = 'VALIDEE'
+	sale.statut_paiement = 'EN_ATTENTE'
+	sale.save(update_fields=['statut', 'statut_paiement'])
+	audit(user, 'CONVERT', 'PROFORMAS', sale.id, f'Proforma {sale.reference} convertie en vente validée')
+	return ok(serialize(sale), 'Proforma convertie en vente validée')
+
+
+@csrf_exempt
+@api_view(['GET', 'POST'])
+def coupons_view(request):
+	user, error = require_user(request)
+	if error: return error
+	if request.method == 'GET':
+		return ok([serialize(c) for c in Coupon.objects.all()])
+	if user.role not in ['ADMIN', 'RESPONSABLE']:
+		return fail('Permission refusée', 403)
+	data = body(request)
+	coupon = Coupon.objects.create(
+		id=uid('CPN'),
+		code=data.get('code', '').strip().upper(),
+		type_remise=data.get('type_remise', 'POURCENTAGE'),
+		valeur=Decimal(str(data.get('valeur', 0))),
+		actif=bool(data.get('actif', True)),
+		date_expiration=data.get('date_expiration') or None
+	)
+	return ok(serialize(coupon), 'Coupon créé')
+
+
+@csrf_exempt
+@api_view(['POST'])
+def validate_coupon_view(request):
+	data = body(request)
+	code = str(data.get('code', '')).strip().upper()
+	coupon = Coupon.objects.filter(code=code, actif=True).first()
+	if not coupon: return fail('Coupon invalide ou inactif', 404)
+	if coupon.date_expiration and coupon.date_expiration < date.today():
+		return fail('Coupon expiré', 400)
+	return ok(serialize(coupon))
 
 
 @csrf_exempt
@@ -233,19 +392,115 @@ def payment_view(request, sale_id):
 	if not sale: return fail('Vente introuvable', 404)
 	data = body(request); payments = data.get('paiements', [])
 	if not payments: return fail('Au moins un paiement est requis')
+
+	session = CaisseSession.objects.filter(caissier=user, statut='OUVERTE').order_by('-date_ouverture').first()
+
 	paid = sum((Decimal(str(item.get('montant', 0) or 0)) for item in payments), Decimal('0'))
 	if paid <= 0: return fail('Le montant doit être positif')
 	already_paid = sum((item.amount for item in sale.payments.filter(status='PAID')), Decimal('0'))
 	remaining = sale.total_ttc - already_paid
 	if paid < remaining: return fail(f'Montant insuffisant : reste {remaining}')
+
+	monnaie = max(Decimal('0'), paid - remaining)
+
 	for item in payments:
 		amount = Decimal(str(item.get('montant', 0) or 0))
 		if amount <= 0: return fail('Montant de paiement invalide')
-		Payment.objects.create(id=uid('PAY'), sale=sale, amount=amount, method=item.get('mode', 'ESPECES'), date=date.today(), status='PAID', reference=item.get('reference', ''))
-	CashMovement.objects.create(id=uid('CASH'), date=date.today(), heure=datetime.now().time(), type='VENTE', reference=sale.reference, description='Encaissement vente', montant_entree=min(paid, remaining), mode_paiement='MIXTE' if len(payments) > 1 else payments[0].get('mode', 'ESPECES'), categorie='Ventes', utilisateur=user)
-	sale.statut_paiement = 'PAYE'; sale.statut = 'PAYEE'; sale.save(update_fields=['statut_paiement', 'statut'])
-	audit(user, 'PAYMENT', 'SALES', sale.id, str(paid))
-	return ok({'vente_id': sale.id, 'montant_recu': float(paid), 'reste': float(remaining), 'monnaie': float(paid - remaining), 'statut_paiement': sale.statut_paiement})
+		Payment.objects.create(
+			id=uid('PAY'),
+			sale=sale,
+			caisse_session=session,
+			amount=amount,
+			monnaie_rendue=monnaie if item.get('mode', 'ESPECES') == 'ESPECES' else Decimal('0'),
+			method=item.get('mode', 'ESPECES'),
+			date=date.today(),
+			status='PAID',
+			reference=item.get('reference', '')
+		)
+
+	net_cash = min(paid, remaining)
+	CashMovement.objects.create(
+		id=uid('CASH'),
+		date=date.today(),
+		heure=datetime.now().time(),
+		type='VENTE',
+		reference=sale.reference,
+		description='Encaissement vente',
+		montant_entree=net_cash,
+		mode_paiement='MIXTE' if len(payments) > 1 else payments[0].get('mode', 'ESPECES'),
+		categorie='Ventes',
+		utilisateur=user
+	)
+
+	sale.statut_paiement = 'PAYE'
+	sale.statut = 'PAYEE'
+	sale.montant_recu = paid
+	sale.monnaie_rendue = monnaie
+	if sale.statut_livraison != 'LIVREE':
+		sale.statut_livraison = 'EN_ATTENTE'
+	sale.save(update_fields=['statut_paiement', 'statut', 'montant_recu', 'monnaie_rendue', 'statut_livraison'])
+
+	audit(user, 'PAYMENT', 'SALES', sale.id, f'Payé: {paid}, Monnaie: {monnaie}')
+	return ok({
+		'vente_id': sale.id,
+		'reference': sale.reference,
+		'total_ttc': float(sale.total_ttc),
+		'montant_recu': float(paid),
+		'reste': 0.0,
+		'monnaie_rendue': float(monnaie),
+		'statut_paiement': sale.statut_paiement,
+		'statut_livraison': sale.statut_livraison,
+		'label_facture': 'Payé – non livré'
+	})
+
+
+@csrf_exempt
+@api_view(['GET', 'POST'])
+def caisse_session_view(request):
+	user, error = require_user(request)
+	if error: return error
+	if request.method == 'GET':
+		session = CaisseSession.objects.filter(caissier=user, statut='OUVERTE').order_by('-date_ouverture').first()
+		return ok(serialize(session) if session else None)
+
+	data = body(request)
+	action = data.get('action', 'OPEN')
+	if action == 'OPEN':
+		existing = CaisseSession.objects.filter(caissier=user, statut='OUVERTE').first()
+		if existing:
+			return fail('Une session de caisse est déjà ouverte pour ce caissier', 400)
+		session = CaisseSession.objects.create(
+			id=uid('CAS'),
+			magasin=getattr(user, 'magasin', None),
+			caissier=user,
+			fond_de_caisse_initial=Decimal(str(data.get('fond_de_caisse_initial', 0) or 0)),
+			statut='OUVERTE'
+		)
+		audit(user, 'OPEN', 'CAISSE', session.id, f'Fond: {session.fond_de_caisse_initial}')
+		return ok(serialize(session), 'Session de caisse ouverte')
+
+	elif action == 'CLOSE':
+		session = CaisseSession.objects.filter(caissier=user, statut='OUVERTE').first()
+		if not session:
+			return fail('Aucune session de caisse ouverte à fermer', 404)
+
+		montant_final = Decimal(str(data.get('montant_final_especes', 0) or 0))
+		cash_payments = Payment.objects.filter(caisse_session=session, method='ESPECES', status='PAID')
+		total_cash_in = sum((p.amount - p.monnaie_rendue for p in cash_payments), Decimal('0'))
+		expected = session.fond_de_caisse_initial + total_cash_in
+		ecart = montant_final - expected
+
+		session.date_fermeture = datetime.now(timezone.utc)
+		session.montant_final_especes = montant_final
+		session.ecart = ecart
+		session.statut = 'FERMEE'
+		session.notes = data.get('notes', '')
+		session.save()
+
+		audit(user, 'CLOSE', 'CAISSE', session.id, f'Écart caisse: {ecart}')
+		return ok(serialize(session), 'Session de caisse fermée')
+
+	return fail('Action inconnue', 400)
 
 
 @api_view(['GET'])
@@ -253,7 +508,7 @@ def cashier_pending_view(request):
 	user, error = require_user(request)
 	if error: return error
 	if user.role not in ['ADMIN', 'CAISSIER', 'RESPONSABLE']: return fail('Permission refusée', 403)
-	sales = Sale.objects.filter(statut_paiement='EN_ATTENTE', statut='PAYEE').order_by('-created_at')
+	sales = Sale.objects.filter(statut_paiement='EN_ATTENTE', statut__in=['VALIDEE', 'PAYEE']).order_by('-created_at')
 	return ok([serialize(item) for item in sales])
 
 
@@ -281,12 +536,136 @@ def confirm_delivery_view(request, sale_id):
 
 @csrf_exempt
 @api_view(['GET', 'POST'])
+def magasins_view(request):
+	user, error = require_user(request)
+	if error: return error
+	if request.method == 'GET':
+		return ok([serialize(m) for m in Magasin.objects.all().order_by('nom')])
+	if user.role not in ['ADMIN', 'RESPONSABLE']:
+		return fail('Permission refusée', 403)
+	data = body(request)
+	m = Magasin.objects.create(
+		id=uid('MAG'),
+		nom=data.get('nom', '').strip(),
+		adresse=data.get('adresse', '').strip(),
+		telephone=data.get('telephone', '').strip()
+	)
+	return ok(serialize(m), 'Magasin créé')
+
+
+@csrf_exempt
+@api_view(['GET', 'POST'])
+def service_contracts_view(request):
+	user, error = require_user(request)
+	if error: return error
+	if request.method == 'GET':
+		return ok([serialize(s) for s in ServiceContract.objects.all().order_by('-created_at')])
+	data = body(request)
+	contract = ServiceContract.objects.create(
+		id=uid('CTR'),
+		reference=uid('CTR'),
+		client_id=data.get('client_id'),
+		titre=data.get('titre', '').strip(),
+		description=data.get('description', '').strip(),
+		type_service=data.get('type_service', 'DEPLOIEMENT'),
+		montant=Decimal(str(data.get('montant', 0) or 0)),
+		date_debut=data.get('date_debut') or date.today(),
+		date_fin=data.get('date_fin') or None,
+		statut=data.get('statut', 'EN_COURS')
+	)
+	audit(user, 'CREATE', 'CRM', contract.id, contract.titre)
+	return ok(serialize(contract), 'Contrat de service créé')
+
+
+@csrf_exempt
+@api_view(['GET', 'POST'])
+@transaction.atomic
+def stock_transfers_view(request):
+	user, error = require_user(request)
+	if error: return error
+	if request.method == 'GET':
+		return ok([serialize(t) for t in StockTransfer.objects.all().order_by('-created_at')])
+	data = body(request)
+	source_id = data.get('magasin_source_id')
+	dest_id = data.get('magasin_dest_id')
+	product_id = data.get('produit_id')
+	qty = Decimal(str(data.get('quantite', 0)))
+
+	if not source_id or not dest_id or source_id == dest_id:
+		return fail('Magasins source et destination invalides')
+	if qty <= 0:
+		return fail('Quantité invalide')
+
+	product = Product.objects.select_for_update().filter(id=product_id).first()
+	if not product:
+		return fail('Produit introuvable', 404)
+
+	transfer = StockTransfer.objects.create(
+		id=uid('TRF'),
+		reference=uid('TRF'),
+		magasin_source_id=source_id,
+		magasin_dest_id=dest_id,
+		produit=product,
+		quantite=qty,
+		statut='EFFECTUE',
+		demandeur=user
+	)
+
+	StockMovement.objects.create(
+		id=uid('MOV'),
+		date=date.today(),
+		heure=datetime.now().time(),
+		type='TRANSFERT',
+		produit=product,
+		magasin_source_id=source_id,
+		magasin_dest_id=dest_id,
+		quantite=qty,
+		reference=transfer.reference,
+		motif=f'Transfert de {source_id} vers {dest_id}',
+		stock_avant=product.stock,
+		stock_apres=product.stock,
+		utilisateur=user
+	)
+
+	audit(user, 'TRANSFER', 'STOCK', transfer.id, f'{product.nom} x {qty}')
+	return ok(serialize(transfer), 'Transfert inter-magasins effectué')
+
+
+@csrf_exempt
+@api_view(['GET', 'POST'])
 def returns_view(request):
 	user, error = require_user(request)
 	if error: return error
 	if request.method == 'GET': return ok([serialize(x) for x in Return.objects.all().order_by('-created_at')])
-	data = body(request); product = Product.objects.get(id=data.get('produit_id')); obj = Return.objects.create(id=uid('RET'), reference=uid('RET'), vente_id=data.get('vente_id'), produit=product, produit_nom=product.nom, quantite=Decimal(str(data.get('quantite', 0))), date=date.today(), motif=data.get('motif', ''), gravite=data.get('gravite', 'MOYENNE'), description=data.get('description', ''), utilisateur=user)
-	audit(user, 'CREATE', 'RETURNS', obj.id); return ok({'id': obj.id})
+	data = body(request); product = Product.objects.get(id=data.get('produit_id'));
+	obj = Return.objects.create(
+		id=uid('RET'),
+		reference=uid('RET'),
+		vente_id=data.get('vente_id'),
+		produit=product,
+		produit_nom=product.nom,
+		quantite=Decimal(str(data.get('quantite', 0))),
+		date=date.today(),
+		motif=data.get('motif', ''),
+		gravite=data.get('gravite', 'MOYENNE'),
+		description=data.get('description', ''),
+		utilisateur=user
+	)
+	montant_rembourse = Decimal(str(data.get('montant_rembourse', 0) or 0))
+	if montant_rembourse > 0:
+		CashMovement.objects.create(
+			id=uid('CASH'),
+			date=date.today(),
+			heure=datetime.now().time(),
+			type='REMBOURSEMENT',
+			reference=obj.reference,
+			description=f'Remboursement retour {obj.reference}',
+			montant_sortie=montant_rembourse,
+			mode_paiement=data.get('mode_paiement', 'ESPECES'),
+			categorie='Retours',
+			utilisateur=user
+		)
+	audit(user, 'CREATE', 'RETURNS', obj.id); return ok(serialize(obj), 'Retour enregistré')
 
 
 @csrf_exempt
