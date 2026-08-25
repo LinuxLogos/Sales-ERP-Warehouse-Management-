@@ -3,14 +3,23 @@ from django.contrib.auth.hashers import check_password, make_password
 from django.db import models
 
 
+class Magasin(models.Model):
+    id = models.CharField(primary_key=True, max_length=32)
+    nom = models.CharField(max_length=120)
+    adresse = models.CharField(max_length=255, blank=True)
+    telephone = models.CharField(max_length=40, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
 class User(models.Model):
     id = models.CharField(primary_key=True, max_length=32)
     email = models.EmailField(unique=True)
     password = models.CharField(max_length=128)
-    role = models.CharField(max_length=20, default='VENDEUR')
+    role = models.CharField(max_length=20, default='COMMERCIAL')
     nom = models.CharField(max_length=120)
     prenom = models.CharField(max_length=120, blank=True)
     actif = models.BooleanField(default=True)
+    magasin = models.ForeignKey(Magasin, null=True, blank=True, on_delete=models.SET_NULL)
     created_at = models.DateTimeField(auto_now_add=True)
     def set_password(self, raw): self.password = make_password(raw)
     def verify_password(self, raw): return check_password(raw, self.password)
@@ -91,7 +100,44 @@ class Customer(models.Model):
     email = models.EmailField(blank=True)
     adresse = models.CharField(max_length=255, blank=True)
     entreprise = models.CharField(max_length=160, blank=True)
+    points_fidelite = models.IntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+class Coupon(models.Model):
+    id = models.CharField(primary_key=True, max_length=32)
+    code = models.CharField(max_length=40, unique=True)
+    type_remise = models.CharField(max_length=20, default='POURCENTAGE')  # POURCENTAGE, MONTANT_FIXE
+    valeur = models.DecimalField(max_digits=14, decimal_places=2)
+    actif = models.BooleanField(default=True)
+    date_expiration = models.DateField(null=True, blank=True)
+
+
+class ServiceContract(models.Model):
+    id = models.CharField(primary_key=True, max_length=32)
+    reference = models.CharField(max_length=32, unique=True)
+    client = models.ForeignKey(Customer, on_delete=models.CASCADE)
+    titre = models.CharField(max_length=160)
+    description = models.TextField(blank=True)
+    type_service = models.CharField(max_length=80, default='DEPLOIEMENT')  # DEPLOIEMENT, RESEAU, MAINTENANCE, SECURITE
+    montant = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    date_debut = models.DateField()
+    date_fin = models.DateField(null=True, blank=True)
+    statut = models.CharField(max_length=20, default='EN_COURS')  # PLANIFIE, EN_COURS, TERMINE, ANNULE
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class CaisseSession(models.Model):
+    id = models.CharField(primary_key=True, max_length=40)
+    magasin = models.ForeignKey(Magasin, null=True, blank=True, on_delete=models.CASCADE)
+    caissier = models.ForeignKey(User, on_delete=models.CASCADE)
+    date_ouverture = models.DateTimeField(auto_now_add=True)
+    date_fermeture = models.DateTimeField(null=True, blank=True)
+    fond_de_caisse_initial = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    montant_final_especes = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    ecart = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    statut = models.CharField(max_length=20, default='OUVERTE')
+    notes = models.TextField(blank=True)
 
 
 class Purchase(models.Model):
@@ -119,6 +165,7 @@ class PurchaseItem(models.Model):
 class Lot(models.Model):
     id = models.CharField(primary_key=True, max_length=32)
     code = models.CharField(max_length=32)
+    magasin = models.ForeignKey(Magasin, null=True, blank=True, on_delete=models.SET_NULL)
     produit = models.ForeignKey(Product, related_name='lots', on_delete=models.CASCADE)
     achat = models.ForeignKey(Purchase, null=True, blank=True, on_delete=models.SET_NULL)
     quantite_initiale = models.DecimalField(max_digits=14, decimal_places=2)
@@ -131,6 +178,7 @@ class Lot(models.Model):
 class Unit(models.Model):
     id = models.CharField(primary_key=True, max_length=32)
     code = models.CharField(max_length=32)
+    magasin = models.ForeignKey(Magasin, null=True, blank=True, on_delete=models.SET_NULL)
     produit = models.ForeignKey(Product, related_name='units', on_delete=models.CASCADE)
     achat = models.ForeignKey(Purchase, null=True, blank=True, on_delete=models.SET_NULL)
     etat = models.CharField(max_length=20, default='DISPONIBLE')
@@ -143,6 +191,7 @@ class Unit(models.Model):
 class Sale(models.Model):
     id = models.CharField(primary_key=True, max_length=32)
     reference = models.CharField(max_length=32, unique=True)
+    magasin = models.ForeignKey(Magasin, null=True, blank=True, on_delete=models.SET_NULL)
     client = models.ForeignKey(Customer, on_delete=models.PROTECT)
     vendeur = models.ForeignKey(User, on_delete=models.PROTECT)
     date = models.DateField()
@@ -150,10 +199,14 @@ class Sale(models.Model):
     sous_total = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     remise_totale = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     total_ttc = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    montant_recu = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    monnaie_rendue = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     mode_paiement = models.CharField(max_length=20, default='ESPECES')
     statut_paiement = models.CharField(max_length=20, default='EN_ATTENTE')
-    statut = models.CharField(max_length=20, default='PAYEE')
+    statut = models.CharField(max_length=20, default='VALIDEE')  # PROFORMA, VALIDEE, PAYEE, LIVREE
     statut_livraison = models.CharField(max_length=20, default='EN_ATTENTE')
+    coupon = models.ForeignKey(Coupon, null=True, blank=True, on_delete=models.SET_NULL)
+    proforma_commercial = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='proformas')
     created_at = models.DateTimeField(auto_now_add=True)
 
 
@@ -195,7 +248,9 @@ class SaleCostAllocation(models.Model):
 class Payment(models.Model):
     id = models.CharField(primary_key=True, max_length=40)
     sale = models.ForeignKey(Sale, related_name='payments', on_delete=models.CASCADE)
+    caisse_session = models.ForeignKey(CaisseSession, null=True, blank=True, on_delete=models.SET_NULL)
     amount = models.DecimalField(max_digits=15, decimal_places=2)
+    monnaie_rendue = models.DecimalField(max_digits=15, decimal_places=2, default=0)
     method = models.CharField(max_length=30)
     date = models.DateField()
     status = models.CharField(max_length=20, default='PAID')
@@ -237,12 +292,26 @@ class StockMovement(models.Model):
     heure = models.TimeField()
     type = models.CharField(max_length=20)
     produit = models.ForeignKey(Product, on_delete=models.CASCADE)
+    magasin_source = models.ForeignKey(Magasin, null=True, blank=True, on_delete=models.SET_NULL, related_name='movements_out')
+    magasin_dest = models.ForeignKey(Magasin, null=True, blank=True, on_delete=models.SET_NULL, related_name='movements_in')
     quantite = models.DecimalField(max_digits=14, decimal_places=2)
     reference = models.CharField(max_length=40)
     motif = models.CharField(max_length=120)
     stock_avant = models.DecimalField(max_digits=14, decimal_places=2)
     stock_apres = models.DecimalField(max_digits=14, decimal_places=2)
     utilisateur = models.ForeignKey(User, null=True, on_delete=models.SET_NULL)
+
+
+class StockTransfer(models.Model):
+    id = models.CharField(primary_key=True, max_length=40)
+    reference = models.CharField(max_length=40, unique=True)
+    magasin_source = models.ForeignKey(Magasin, on_delete=models.CASCADE, related_name='transfers_out')
+    magasin_dest = models.ForeignKey(Magasin, on_delete=models.CASCADE, related_name='transfers_in')
+    produit = models.ForeignKey(Product, on_delete=models.CASCADE)
+    quantite = models.DecimalField(max_digits=14, decimal_places=2)
+    statut = models.CharField(max_length=20, default='EFFECTUE')
+    demandeur = models.ForeignKey(User, null=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class Return(models.Model):
