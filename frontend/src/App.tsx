@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
-import { Boxes, Calculator, ChevronDown, LayoutDashboard, LogOut, Menu, Package, Plus, Receipt, RotateCcw, Search, ShoppingCart, Truck, Users, Wallet, X, ArrowLeftRight, FileText, CheckCircle2 } from 'lucide-react'
+import { Boxes, Calculator, ChevronDown, LayoutDashboard, LogOut, Menu, Package, Plus, Receipt, RotateCcw, Search, ShoppingCart, Truck, Users, Wallet, X, ArrowLeftRight, FileText, CheckCircle2, BarChart3 } from 'lucide-react'
 import './App.css'
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000/api'
@@ -14,18 +14,25 @@ const dateLabel = (value: string) => value ? new Date(value).toLocaleDateString(
 
 async function request(path: string, options: RequestInit = {}, user?: User) {
   const token = localStorage.getItem('linuxlogos_access')
-  const response = await fetch(`${API}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(user ? { 'X-User-Id': user.id } : {}),
-      ...(options.headers || {})
+  try {
+    const response = await fetch(`${API}${path}`, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(user ? { 'X-User-Id': user.id } : {}),
+        ...(options.headers || {})
+      }
+    })
+    const result = await response.json()
+    if (!response.ok || result.success === false) throw new Error(result.message || 'Erreur serveur')
+    return result.data
+  } catch (err: any) {
+    if (err instanceof TypeError && err.message.includes('fetch')) {
+      throw new Error('OFFLINE_NETWORK_ERROR')
     }
-  })
-  const result = await response.json()
-  if (!response.ok || result.success === false) throw new Error(result.message || 'Erreur serveur')
-  return result.data
+    throw err
+  }
 }
 
 const allNavigation = [
@@ -48,6 +55,7 @@ const allNavigation = [
   ['accounting', 'Comptabilité', Calculator, ['ADMIN', 'RESPONSABLE']],
   ['treasury', 'Trésorerie', Wallet, ['ADMIN', 'RESPONSABLE']],
   ['expenses', 'Dépenses', Receipt, ['ADMIN', 'RESPONSABLE']],
+  ['reports', 'Rapports & Analytics', BarChart3, ['ADMIN', 'COMMERCIAL', 'CAISSIER', 'RESPONSABLE']],
   ['logs', 'Journal d\'Activité', Receipt, ['ADMIN', 'RESPONSABLE']]
 ] as const
 
@@ -206,6 +214,7 @@ function Page({ route, user }: { route: string; user: User }) {
   if (route === 'expenses') return <CrudPage title="Dépenses" endpoint="expenses" fields={['categorie', 'montant', 'date', 'description']} user={user} />
   if (route === 'treasury') return <Treasury user={user} />
   if (route === 'accounting') return <Accounting user={user} />
+  if (route === 'reports') return <Reports user={user} />
   return <SimplePanel title="Journal d'activité" text="L'historique d'audit s'affiche ici." />
 }
 
@@ -278,13 +287,39 @@ function POS({ user }: { user: User }) {
   const [couponCode, setCouponCode] = useState('')
   const [appliedCoupon, setAppliedCoupon] = useState<Entity | null>(null)
   const [message, setMessage] = useState('')
+  const [offlineCount, setOfflineCount] = useState<number>(() => JSON.parse(localStorage.getItem('linuxlogos_offline_sales') || '[]').length)
+
+  const syncOfflineSales = async () => {
+    const queue: any[] = JSON.parse(localStorage.getItem('linuxlogos_offline_sales') || '[]')
+    if (!queue.length) return
+    const remaining: any[] = []
+    let synced = 0
+    for (const item of queue) {
+      try {
+        await request('/sales/', { method: 'POST', body: JSON.stringify(item) }, user)
+        synced++
+      } catch (err) {
+        remaining.push(item)
+      }
+    }
+    localStorage.setItem('linuxlogos_offline_sales', JSON.stringify(remaining))
+    setOfflineCount(remaining.length)
+    if (synced > 0) {
+      setMessage(`Synchronisation réussie : ${synced} vente(s) hors-ligne envoyée(s) au serveur.`)
+      request('/products/').then(setProducts).catch(() => {})
+    }
+  }
 
   useEffect(() => {
     Promise.all([request('/products/'), request('/customers/', {}, user)]).then(([p, c]) => {
       setProducts(p)
       setCustomers(c)
       if (c.length) setCustomerId(c[0].id)
-    })
+    }).catch(() => {})
+
+    syncOfflineSales()
+    window.addEventListener('online', syncOfflineSales)
+    return () => window.removeEventListener('online', syncOfflineSales)
   }, [user])
 
   const shown = products.filter(p => p.stock > 0 && (p.nom.toLowerCase().includes(query.toLowerCase()) || (p.reference && p.reference.toLowerCase().includes(query.toLowerCase()))))
@@ -320,17 +355,27 @@ function POS({ user }: { user: User }) {
     const customer = customers.find(c => c.id === customerId)
     if (!customer) return setMessage('Sélectionnez un client.')
 
-    try {
-      const result = await request('/sales/', {
-        method: 'POST',
-        body: JSON.stringify({
-          client_id: customer.id,
-          proforma: isProforma,
-          coupon_code: appliedCoupon ? appliedCoupon.code : undefined,
-          lignes: cart.map(x => ({ produit_id: x.id, prix_unitaire: x.prix_vente, quantite: x.qty, remise: 0 }))
-        })
-      }, user)
+    const payload = {
+      client_id: customer.id,
+      proforma: isProforma,
+      coupon_code: appliedCoupon ? appliedCoupon.code : undefined,
+      lignes: cart.map(x => ({ produit_id: x.id, prix_unitaire: x.prix_vente, quantite: x.qty, remise: 0 }))
+    }
 
+    if (!navigator.onLine) {
+      const queue: any[] = JSON.parse(localStorage.getItem('linuxlogos_offline_sales') || '[]')
+      queue.push(payload)
+      localStorage.setItem('linuxlogos_offline_sales', JSON.stringify(queue))
+      setOfflineCount(queue.length)
+      setMessage(`Mode hors-ligne : Vente enregistrée en local (${queue.length} en attente de synchro).`)
+      setCart([])
+      setAppliedCoupon(null)
+      setCouponCode('')
+      return
+    }
+
+    try {
+      const result = await request('/sales/', { method: 'POST', body: JSON.stringify(payload) }, user)
       if (isProforma) {
         setMessage(`Proforma ${result.reference} créée (${money(result.total)}). Conservée dans vos devis.`)
       } else {
@@ -340,8 +385,19 @@ function POS({ user }: { user: User }) {
       setAppliedCoupon(null)
       setCouponCode('')
       setProducts(await request('/products/'))
-    } catch (e) {
-      setMessage((e as Error).message)
+    } catch (e: any) {
+      if (e.message === 'OFFLINE_NETWORK_ERROR') {
+        const queue: any[] = JSON.parse(localStorage.getItem('linuxlogos_offline_sales') || '[]')
+        queue.push(payload)
+        localStorage.setItem('linuxlogos_offline_sales', JSON.stringify(queue))
+        setOfflineCount(queue.length)
+        setMessage(`Connexion interrompue : Vente mise en attente de synchronisation (${queue.length} hors-ligne).`)
+        setCart([])
+        setAppliedCoupon(null)
+        setCouponCode('')
+      } else {
+        setMessage(e.message)
+      }
     }
   }
 
@@ -398,6 +454,13 @@ function POS({ user }: { user: User }) {
               <span>Total TTC</span>
               <strong>{money(total)}</strong>
             </div>
+
+            {offlineCount > 0 && (
+              <div className="notice" style={{ background: '#fef3c7', color: '#92400e', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span>{offlineCount} vente(s) enregistrée(s) hors-ligne</span>
+                <button className="secondary" style={{ fontSize: '.75rem', padding: '.2rem .5rem' }} onClick={syncOfflineSales}>Synchroniser</button>
+              </div>
+            )}
 
             <div style={{ display: 'grid', gap: '.5rem' }}>
               <button className="primary wide" onClick={() => validateOrder(false)}>Valider la vente (Transmettre au Caissier)</button>
@@ -1076,6 +1139,91 @@ function Treasury({ user }: { user: User }) {
           ])}
         />
       </Panel>
+    </>
+  )
+}
+
+function Reports({ user }: { user: User }) {
+  const [magasins, setMagasins] = useState<Entity[]>([])
+  const [data, setData] = useState<any>(null)
+  const [magasinId, setMagasinId] = useState('')
+  const [commercialId, setCommercialId] = useState('')
+  const [startDate, setStartDate] = useState('')
+  const [endDate, setEndDate] = useState('')
+
+  async function loadReports() {
+    const params = new URLSearchParams()
+    if (magasinId) params.append('magasin_id', magasinId)
+    if (commercialId) params.append('commercial_id', commercialId)
+    if (startDate) params.append('start_date', startDate)
+    if (endDate) params.append('end_date', endDate)
+
+    const query = params.toString() ? `?${params.toString()}` : ''
+    const res = await request(`/analytics/${query}`, {}, user)
+    setData(res)
+  }
+
+  useEffect(() => {
+    request('/magasins/', {}, user).then(setMagasins).catch(() => {})
+    loadReports()
+  }, [user])
+
+  function filterReports(e: FormEvent) {
+    e.preventDefault()
+    loadReports()
+  }
+
+  return (
+    <>
+      <Panel title="Filtres des Rapports de Ventes">
+        <form onSubmit={filterReports} className="form-grid" style={{ padding: '1rem' }}>
+          <label>Magasin
+            <select value={magasinId} onChange={e => setMagasinId(e.target.value)}>
+              <option value="">Tous les magasins</option>
+              {magasins.map(m => <option key={m.id} value={m.id}>{m.nom}</option>)}
+            </select>
+          </label>
+          <label>Commercial / Vendeur (ID)
+            <input value={commercialId} onChange={e => setCommercialId(e.target.value)} placeholder="Tous les commerciaux..." />
+          </label>
+          <label>Date Début
+            <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} />
+          </label>
+          <label>Date Fin
+            <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} />
+          </label>
+          <button className="primary" style={{ gridColumn: '1 / -1' }}>Générer le rapport</button>
+        </form>
+      </Panel>
+
+      <div className="metric-grid" style={{ marginTop: '1rem' }}>
+        <Metric label="Chiffre d'Affaires" value={money(data?.ca)} note="Total ventes filtrées" accent />
+        <Metric label="Nombre de Ventes" value={String(data?.nbVentes || 0)} note="Transactions" />
+      </div>
+
+      <div className="two-columns" style={{ marginTop: '1rem' }}>
+        <Panel title="Ventes par Jour">
+          <Table
+            headers={['Date', 'Nombre de ventes', 'Chiffre d\'Affaires']}
+            rows={(data?.salesByDay || []).map((row: any) => [
+              dateLabel(row.date),
+              row.nb_ventes,
+              money(row.ca)
+            ])}
+          />
+        </Panel>
+
+        <Panel title="Détail des Articles Vendus">
+          <Table
+            headers={['Article / Produit', 'Quantité Vendue', 'Montant Total TTC']}
+            rows={(data?.articlesVendus || []).map((row: any) => [
+              <b>{row.nom}</b>,
+              row.quantite,
+              money(row.total)
+            ])}
+          />
+        </Panel>
+      </div>
     </>
   )
 }

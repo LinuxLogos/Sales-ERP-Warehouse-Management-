@@ -704,7 +704,73 @@ def accounting_view(request):
 	return ok({'sales': [serialize(detail) for detail in details[:200]], 'financial': {'ca': float(ca), 'cogs': float(cogs), 'achats': float(sum((item.cout_total for item in purchases), Decimal('0'))), 'depenses': float(depenses), 'margeBrute': float(margin), 'resultat': float(margin - depenses), 'tresorerie': float(cash), 'valeurStock': float(stock_value), 'nbVentes': sales.count(), 'nbAchats': purchases.count()}})
 
 @api_view(['GET'])
-def analytics_view(request): return ok({'salesByDay': [], 'topProducts': []})
+def analytics_view(request):
+	user, error = require_user(request)
+	if error: return error
+	magasin_id = request.GET.get('magasin_id')
+	commercial_id = request.GET.get('commercial_id') or request.GET.get('vendeur_id')
+	date_debut = request.GET.get('date_debut') or request.GET.get('start_date')
+	date_fin = request.GET.get('date_fin') or request.GET.get('end_date')
+
+	qs = Sale.objects.exclude(statut='PROFORMA')
+	if magasin_id:
+		qs = qs.filter(magasin_id=magasin_id)
+	if commercial_id:
+		qs = qs.filter(vendeur_id=commercial_id)
+	if date_debut:
+		qs = qs.filter(date__gte=date_debut)
+	if date_fin:
+		qs = qs.filter(date__lte=date_fin)
+
+	ca = sum((s.total_ttc for s in qs), Decimal('0'))
+	nb_ventes = qs.count()
+
+	# Articles sold breakdown
+	sale_ids = qs.values_list('id', flat=True)
+	details = SaleDetail.objects.filter(vente_id__in=sale_ids)
+
+	top_products_dict = {}
+	for d in details:
+		key = d.produit_nom or str(d.produit_id)
+		if key not in top_products_dict:
+			top_products_dict[key] = {'nom': key, 'quantite': Decimal('0'), 'total': Decimal('0')}
+		top_products_dict[key]['quantite'] += d.quantite
+		top_products_dict[key]['total'] += d.sous_total
+
+	articles_vendus = [
+		{
+			'nom': item['nom'],
+			'quantite': float(item['quantite']),
+			'total': float(item['total'])
+		}
+		for item in sorted(top_products_dict.values(), key=lambda x: x['total'], reverse=True)
+	]
+
+	# Sales by day breakdown
+	sales_by_day_dict = {}
+	for s in qs:
+		d_str = str(s.date)[:10] if s.date else ''
+		if d_str not in sales_by_day_dict:
+			sales_by_day_dict[d_str] = {'date': d_str, 'ca': Decimal('0'), 'nb': 0}
+		sales_by_day_dict[d_str]['ca'] += s.total_ttc
+		sales_by_day_dict[d_str]['nb'] += 1
+
+	sales_by_day = [
+		{
+			'date': item['date'],
+			'ca': float(item['ca']),
+			'nb_ventes': item['nb']
+		}
+		for item in sorted(sales_by_day_dict.values(), key=lambda x: x['date'])
+	]
+
+	return ok({
+		'ca': float(ca),
+		'nbVentes': nb_ventes,
+		'articlesVendus': articles_vendus,
+		'salesByDay': sales_by_day,
+		'topProducts': articles_vendus[:5]
+	})
 @api_view(['GET'])
 def forecast_view(request): return ok({'sales': [], 'treasury': []})
 @api_view(['GET'])

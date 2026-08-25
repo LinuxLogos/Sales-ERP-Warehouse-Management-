@@ -95,3 +95,13 @@ class SalesCostTest(TestCase):
         res_ctr = self.client.post('/api/service-contracts/', {'client_id': self.customer.id, 'titre': 'Déploiement Réseau', 'type_service': 'RESEAU', 'montant': 150000}, format='json', HTTP_X_USER_ID=self.user.id)
         self.assertEqual(res_ctr.status_code, 200)
         self.assertEqual(res_ctr.json()['data']['titre'], 'Déploiement Réseau')
+
+    def test_analytics_reports_filter(self):
+        # Create a completed sale
+        self.client.post('/api/sales/', {'client_id': self.customer.id, 'lignes': [{'produit_id': self.product.id, 'quantite': 4, 'prix_unitaire': 250}]}, format='json', HTTP_X_USER_ID=self.user.id)
+        res = self.client.get('/api/analytics/?start_date=2000-01-01', HTTP_X_USER_ID=self.user.id)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()['data']
+        self.assertGreater(data['ca'], 0)
+        self.assertGreater(data['nbVentes'], 0)
+        self.assertTrue(len(data['articlesVendus']) > 0)
